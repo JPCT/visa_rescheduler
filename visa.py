@@ -5,6 +5,7 @@ import json
 import random
 import platform
 import configparser
+import re
 from datetime import datetime
 
 import requests
@@ -80,16 +81,62 @@ def send_notification(msg):
         }
         requests.post(url, data)
 
+def get_response_body(driver, target_url_part, timeout=10):
+    """
+    Captures the response body of a specific request in Selenium using CDP.
+
+    :param driver: Selenium WebDriver instance
+    :param target_url_part: Part of the URL to match (e.g., "/appointment/days/")
+    :param timeout: Maximum time (in seconds) to wait for the response
+    :return: Response body as a string, or None if not found
+    """
+    start_time = time.time()
+    matching_request_id = None
+
+    while time.time() - start_time < timeout:
+        logs = driver.get_log("performance")
+
+        # Step 1: Find the request ID for the target request
+        for entry in logs:
+            log_msg = json.loads(entry["message"])
+            message = log_msg["message"]
+
+            if message["method"] == "Network.requestWillBeSent":
+                request_url = message["params"]["request"]["url"]
+
+                if target_url_part in request_url:
+                    print(f"Matched Request: {request_url}")
+                    matching_request_id = message["params"]["requestId"]
+                    break  # Stop once we find the target request
+
+        # Step 2: Fetch the response if requestId was found
+        if matching_request_id:
+            for entry in logs:
+                log_msg = json.loads(entry["message"])
+                message = log_msg["message"]
+
+                if message["method"] == "Network.responseReceived":
+                    if message["params"]["requestId"] == matching_request_id:
+                        # Get response body
+                        response = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": matching_request_id})
+                        return response.get("body", None)
+
+        time.sleep(0.5)  # Short delay before rechecking logs
+
+    print("No matching response found within timeout.")
+    return None
 
 def get_driver():
     if LOCAL_USE:
-        dr = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
+        options = webdriver.ChromeOptions()
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})  # Enable performance logs
+        dr = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        dr.execute_cdp_cmd("Network.enable", {})
     else:
         dr = webdriver.Remote(command_executor=HUB_ADDRESS, options=webdriver.ChromeOptions())
     return dr
 
 driver = get_driver()
-
 
 def login():
     # Bypass reCAPTCHA
@@ -139,104 +186,39 @@ def do_login_action():
         EC.presence_of_element_located((By.XPATH, REGEX_CONTINUE)))
     print("\tlogin successful!")
 
+def find_oldest_date_from_text(text):
+    """
+    Extracts dates from a text response and finds the oldest one.
 
-def get_date():
-    driver.get(DATE_URL)
-    if not is_logged_in():
-        login()
-        return get_date()
-    else:
-        content = driver.find_element(By.TAG_NAME, 'pre').text
-        date = json.loads(content)
-        return date
+    :param text: String containing dates in 'yyyy-MM-dd' format.
+    :return: The oldest date as a string in 'yyyy-MM-dd' format.
+    """
+    dates = re.findall(r"\d{4}-\d{2}-\d{2}", text)
+    if not dates:
+        return None  # No valid dates found
+    
+    date_objects = [datetime.strptime(date, "%Y-%m-%d") for date in dates]
+    oldest_date = min(date_objects)
+    return oldest_date.strftime("%Y-%m-%d")
 
-
-def get_time(date):
-    time_url = TIME_URL % date
-    driver.get(time_url)
-    content = driver.find_element(By.TAG_NAME, 'pre').text
-    data = json.loads(content)
-    time = data.get("available_times")[-1]
-    print(f"Got time successfully! {date} {time}")
-    return time
-
-
-def reschedule(date):
-    global EXIT
-    print(f"Starting Reschedule ({date})")
-
-    time = get_time(date)
+def get_nearest_date():
     driver.get(APPOINTMENT_URL)
+    response_body = get_response_body(driver, "/appointment/days/")
+    nearest_date = find_oldest_date_from_text(response_body)
+    return nearest_date
 
-    data = {
-        "utf8": driver.find_element(by=By.NAME, value='utf8').get_attribute('value'),
-        "authenticity_token": driver.find_element(by=By.NAME, value='authenticity_token').get_attribute('value'),
-        "confirmed_limit_message": driver.find_element(by=By.NAME, value='confirmed_limit_message').get_attribute('value'),
-        "use_consulate_appointment_capacity": driver.find_element(by=By.NAME, value='use_consulate_appointment_capacity').get_attribute('value'),
-        "appointments[consulate_appointment][facility_id]": FACILITY_ID,
-        "appointments[consulate_appointment][date]": date,
-        "appointments[consulate_appointment][time]": time,
-    }
-
-    headers = {
-        "User-Agent": driver.execute_script("return navigator.userAgent;"),
-        "Referer": APPOINTMENT_URL,
-        "Cookie": "_yatri_session=" + driver.get_cookie("_yatri_session")["value"]
-    }
-
-    r = requests.post(APPOINTMENT_URL, headers=headers, data=data)
-    if(r.text.find('Successfully Scheduled') != -1):
-        msg = f"Rescheduled Successfully! {date} {time}"
-        send_notification(msg)
-        EXIT = True
-    else:
-        msg = f"Reschedule Failed. {date} {time}"
-        send_notification(msg)
-
-
-def is_logged_in():
-    content = driver.page_source
-    if(content.find("error") != -1):
-        return False
-    return True
-
-
-def print_dates(dates):
-    print("Available dates:")
-    for d in dates:
-        print("%s \t business_day: %s" % (d.get('date'), d.get('business_day')))
-    print()
-
-
-last_seen = None
-
-
-def get_available_date(dates):
-    global last_seen
-
-    def is_earlier(date):
-        my_date = datetime.strptime(MY_SCHEDULE_DATE, "%Y-%m-%d")
-        new_date = datetime.strptime(date, "%Y-%m-%d")
-        result = my_date > new_date
-        print(f'Is {my_date} > {new_date}:\t{result}')
-        return result
-
-    print("Checking for an earlier date:")
-    for d in dates:
-        date = d.get('date')
-        if is_earlier(date) and date != last_seen:
-            _, month, day = date.split('-')
-            if(MY_CONDITION(month, day)):
-                last_seen = date
-                return date
-
+def is_earlier(date):
+    my_date = datetime.strptime(MY_SCHEDULE_DATE, "%Y-%m-%d")
+    new_date = datetime.strptime(date, "%Y-%m-%d")
+    result = my_date > new_date
+    print(f'Is {my_date} > {new_date}:\t{result}')
+    return result
 
 def push_notification(dates):
     msg = "date: "
     for d in dates:
         msg = msg + d.get('date') + '; '
     send_notification(msg)
-
 
 if __name__ == "__main__":
     login()
@@ -250,24 +232,21 @@ if __name__ == "__main__":
             print(f"Retry count: {retry_count}")
             print()
 
-            dates = get_date()[:5]
-            if not dates:
+            date = get_nearest_date()
+            if not date:
               msg = "List is empty"
               send_notification(msg)
               EXIT = True
-            print_dates(dates)
-            date = get_available_date(dates)
-            print()
-            print(f"New date: {date}")
-            if date:
-                reschedule(date)
-                push_notification(dates)
+            print("Nearest date: " + str(date))
+            if is_earlier(date):
+                print(f"New date: {date}")
+                send_notification("New available nearest date: " + str(date) + "!!!")
 
             if(EXIT):
                 print("------------------exit")
                 break
 
-            if not dates:
+            if not date:
               msg = "List is empty"
               send_notification(msg)
               #EXIT = True
