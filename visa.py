@@ -27,6 +27,8 @@ USERNAME = config['USVISA']['USERNAME']
 PASSWORD = config['USVISA']['PASSWORD']
 SCHEDULE_ID = config['USVISA']['SCHEDULE_ID']
 MY_SCHEDULE_DATE = config['USVISA']['MY_SCHEDULE_DATE']
+DESIRE_DATE_BEGIN = config['USVISA']['DESIRE_DATE_BEGIN']
+DESIRE_DATE_END = config['USVISA']['DESIRE_DATE_END']
 COUNTRY_CODE = config['USVISA']['COUNTRY_CODE'] 
 FACILITY_ID = config['USVISA']['FACILITY_ID']
 
@@ -44,7 +46,7 @@ REGEX_CONTINUE = "//a[contains(text(),'Continuar')]"
 def MY_CONDITION(month, day): return True # No custom condition wanted for the new scheduled date
 
 STEP_TIME = 0.5  # time between steps (interactions with forms): 0.5 seconds
-RETRY_TIME = 60*10  # wait time between retries/checks for available dates: 10 minutes
+RETRY_TIME = 60*1  # wait time between retries/checks for available dates: 10 minutes
 EXCEPTION_TIME = 60*30  # wait time when an exception occurs: 30 minutes
 COOLDOWN_TIME = 60*60  # wait time when temporary banned (empty list): 60 minutes
 
@@ -52,6 +54,7 @@ DATE_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_I
 TIME_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 APPOINTMENT_URL = f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment"
 EXIT = False
+driver = None
 
 
 def send_notification(msg):
@@ -136,8 +139,6 @@ def get_driver():
         dr = webdriver.Remote(command_executor=HUB_ADDRESS, options=webdriver.ChromeOptions())
     return dr
 
-driver = get_driver()
-
 def login():
     # Bypass reCAPTCHA
     driver.get(f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv")
@@ -214,6 +215,14 @@ def is_earlier(date):
     print(f'Is {my_date} > {new_date}:\t{result}')
     return result
 
+def is_between_desired_dates(date):
+    new_date = datetime.strptime(date, "%Y-%m-%d")
+    desire_date_begin = datetime.strptime(DESIRE_DATE_BEGIN, "%Y-%m-%d")
+    desire_date_end = datetime.strptime(DESIRE_DATE_END, "%Y-%m-%d")
+    result = desire_date_begin < new_date and desire_date_end > new_date
+    print(f'Is {new_date} between {desire_date_begin} and {desire_date_end}:\t{result}')
+    return result
+
 def push_notification(dates):
     msg = "date: "
     for d in dates:
@@ -221,38 +230,32 @@ def push_notification(dates):
     send_notification(msg)
 
 if __name__ == "__main__":
-    login()
     retry_count = 0
-    while 1:
+    while not EXIT:
         if retry_count > 6:
             break
         try:
+            driver = get_driver()
+            login()
             print("------------------")
             print(datetime.today())
             print(f"Retry count: {retry_count}")
             print()
 
             date = get_nearest_date()
-            if not date:
-              msg = "List is empty"
-              send_notification(msg)
-              EXIT = True
             print("Nearest date: " + str(date))
-            if is_earlier(date):
+            if is_between_desired_dates(date):
                 print(f"New date: {date}")
                 send_notification("New available nearest date: " + str(date) + "!!!")
+                EXIT = True
+
+            driver.quit()
 
             if(EXIT):
                 print("------------------exit")
                 break
 
-            if not date:
-              msg = "List is empty"
-              send_notification(msg)
-              #EXIT = True
-              time.sleep(COOLDOWN_TIME)
-            else:
-              time.sleep(RETRY_TIME)
+            time.sleep(RETRY_TIME)
 
         except:
             retry_count += 1
